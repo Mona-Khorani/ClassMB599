@@ -37,13 +37,13 @@ library(e1071)
 
 
 ```{r}
-OTUR<- read.csv ("Normalized Peptide Data Abundance OUT1_Sample1 Labels.csv", header = FALSE,)
+OTUR<- read.csv ("Normalized_Peptide_Data_Abundance_OUT1_Sample1_Labels.csv", header = FALSE,)
 OTUR1 <-sapply(OTUR,as.numeric)
 OTU <- (t(OTUR1))
 OTU[is.na(OTU)]<-0
 
 test <- read.csv("test.csv", header = TRUE) #test.csv is file with peptides names in the first column 
-taxmat <- read.csv ("Cat_phyloseq - phlyo.csv", header=FALSE,)
+taxmat <- read.csv ("Cat_phyloseq_phlyo.csv", header=FALSE,)
 
 
 otumat <- OTU[2:15,2:778]
