@@ -1,0 +1,206 @@
+---
+title: "ml_practical"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#TODO: set working directory
+#install.packages("Matrix")
+#install.packages("plyr")
+install.packages("biomformat")
+
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("phyloseq")
+
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("biomformat")
+
+library(biomformat)
+library(plyr)
+library(vegan)
+library(ape)
+library(glmnet)
+library(caret)
+library(phyloseq)
+library(randomForest)
+library(e1071)
+```
+
+## Load Dataset
+
+
+```{r}
+OTUR<- read.csv ("Normalized Peptide Data Abundance OUT1_Sample1 Labels.csv", header = FALSE,)
+OTUR1 <-sapply(OTUR,as.numeric)
+OTU <- (t(OTUR1))
+OTU[is.na(OTU)]<-0
+
+test <- read.csv("test.csv", header = TRUE) #test.csv is file with peptides names in the first column 
+taxmat <- read.csv ("Cat_phyloseq - phlyo.csv", header=FALSE,)
+
+
+otumat <- OTU[2:15,2:778]
+rownames(otumat) <- paste0("Sample", 1:nrow(otumat))
+colnames(otumat) <- test[1:777,1]
+otumat[is.na(otumat)]<-0
+str(otumat)
+otumat <- as.matrix(otumat)
+otumat1 <-t(otumat)
+class(otumat1)
+#View(otumat1)
+
+
+taxmat<-taxmat[2:778,2:8]
+rownames(taxmat) <- test[1:777,1]
+colnames(taxmat) <- c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+taxmat=as.matrix(taxmat)
+class(taxmat)
+#View(taxmat)
+
+
+OTU2 <- otu_table(otumat1, taxa_are_rows = TRUE)
+OTU3 <- t(OTU2)
+str(OTU3)
+
+TAX <- tax_table(taxmat)
+str(TAX)
+
+physeq <- phyloseq(OTU3, TAX)
+plot_bar(physeq, fill = "Family")
+
+random_tree = rtree(ntaxa(physeq), rooted=TRUE, tip.label=taxa_names(physeq))
+plot(random_tree)
+
+
+sampledata <- sample_data(data.frame(
+Class = sample(LETTERS[1:2], size=nsamples(physeq), replace=TRUE),
+Depth = sample(50:1000, size=nsamples(physeq), replace=TRUE),
+row.names=sample_names(physeq),
+stringsAsFactors=FALSE))
+
+sampledata$Class <- c("T","T","T","T","T","T","T","M","M","M","M","M","M","M")
+ps <- merge_phyloseq(physeq,sampledata , random_tree)
+#View(ps)
+```
+### Normally, we would check: 1. Normalize counts and 2. Remove outliers, but we've already done this in previous practicals. Let's just take a look at a PCoA of all the samples colored by hive role
+```{r, fig.height = 4, fig.width = 10}
+ord <- ordinate(ps, method = "PCoA", distance = 'bray') #We usually use bray curtis distance for PCoA of microbiome data, rather than euclidean. For machine learning though, because we will be transforming the variable counts so that our model weights are more interpretable, bray curtis distance will end up looking like nonsense. Therefore, for this application, we'll use euclidean.
+plot_ordination(ps, ord, 'samples', color = 'Class')
+```
+
+### As mentioned in lecture, we'll be building 3 models, each one will return the likelihood that the sample in question is a (F=Forager, W=Worker, H=Nurse) bee. Let's make a binary column in our sample_data for each hive role. Lastly, plot an ordination colored by one of those columns (this should look very familiar from lecture)
+```{r, fig.height = 4, fig.width = 10}
+#add a column to the sample_data that is true/false this bee is a forager, nurse, or worker
+ps@sam_data$Class_T = ps@sam_data$Class == "T"
+ps@sam_data$Class_M = ps@sam_data$Class == "M"
+plot_ordination(ps, ord, 'samples', color = 'Class_T')
+```
+
+### Center each feature around its mean and divide by its standard deviation. This will not change the predictions of our model, but it will allow us to draw conclusions about the relative importance of features from the weights the model learns. If you do not do this step, the only conclusions you can draw from the weights of the model are whether a feature has positive or negative association with the outcome metric, but you can't say anything about the magnitude
+```{r}
+otu_table(ps) <- otu_table(apply(ps@otu_table, 2, function(x) return( (x - mean(x)) / sd(x))), taxa_are_rows = FALSE)
+```
+
+
+
+## Random Forest
+
+### Set aside testing data
+```{r, fig.height = 6}
+set.seed(1)
+index_train <- createDataPartition(ps@sam_data$Class, p = 0.7)[[1]]
+x_train <- ps@otu_table[index_train, ]
+x_test <- ps@otu_table[-index_train, ]
+
+#split the phyloseq objects into training and testing to make our lives easier later on
+ps_train <- phyloseq(otu_table(ps@otu_table[index_train, ], taxa_are_rows = F), ps@sam_data[index_train, ])
+ps_test <- phyloseq(otu_table(ps@otu_table[-index_train, ], taxa_are_rows = F), ps@sam_data[-index_train, ])
+```
+
+### Find the optimal tree depth (mtry) using cross validation with the caret package
+```{r}
+#Notes:
+#trainControl is basically a controller for the cross-validation process. It will get passed to the train command. The package we used above, glmnet, does cross validation for you. Because glmnet doesn't implement random forests, we'll be using the caret package to handle our cross-validation
+
+#The train function in caret will want the data as a dataframe where one column is singled out at the answers. Our answers will be the "hive_role" column which we're creating here
+set.seed(1)
+data_train = data.frame(x_train)
+data_train$R = ps_train@sam_data$Class
+control <- trainControl(method='repeatedcv', 
+                        number=3, 
+                        repeats=3,
+                        allowParallel = F)
+
+tunegrid <- expand.grid(.mtry=c(1:20)) #mtry is the depth of each decision tree. We'll be trying out models where each tree is 3 to 20 splits deep
+rf <- train(R ~., 
+            data= data_train, 
+            method='rf', 
+            metric='Accuracy', 
+            tuneGrid=tunegrid, 
+            trControl=control)
+print(rf)
+
+## Accuracy is measured using the test set assigned at each fold during cross validation. These small sub-test sets are called validation sets, for the sake of unique vocabulary. Similar to how we used cv.glmnet above to find the optimal strength of regularization, checking our error on these validation sets during cross validation allows us to pick a tree depth that will likely work best on outside data. Remember that the cross validation is happening on the training set, so we still have the actual test set to check performance on. 
+
+# In general, the deeper the trees, the more the model overfits the training data, resulting in lower accuracy on the validation set. The "Accuracy" reported here for each value of mtry is the accuracy on the 'out of bag' samples, or the temporary validation sets created by the random forest algorithm
+
+#In this case, you may see that regardless of tree depth, we predict the validation set perfectly (also said as "the out of bag error is 0"). In general, there should be a 'sweet spot' where a deeper tree depth overfits and a shallowed tree depth does not learn enough. 
+```
+
+### Let's try the model performance on the held out test set, using the value for mtry (tree depth) chosen during cross validation
+```{r, fig.height = 4, fig.width = 10}
+mtry_best = as.numeric(rf$bestTune)
+model = randomForest(x_train, y = as.factor(ps_train@sam_data$Class), mtry = mtry_best)
+
+#Performance on test set
+preds = predict(model, x_test)
+print(paste("Accuracy: ", sum(preds == as.factor(ps_test@sam_data$Class)) / nsamples(ps_test)))
+
+#Visualize on test dataset
+ord <- ordinate(ps_test, method = "PCoA", distance = 'euclidean')
+ps_test@sam_data$rf_predictions = predict(model, ps_test@otu_table)
+plot_ordination(ps_test, ord, 'samples', color = 'Class', shape = 'rf_predictions') + geom_point(size = 4)
+
+#One of the reasons random forests are nice is because we don't have to deal with multiple models to classify multiple output types.
+```
+
+### Now we'd like to know which taxa were most important in training the full model (all data). Notice that every time you train a model and take a look at the importance of variables, you get a different graph for the importance of each variable. Run this command multiple times to see this.
+```{r, fig.height = 7, fig.width = 7}
+model = randomForest(ps@otu_table, y = as.factor(ps@sam_data$Class), mtry = mtry_best)
+varImpPlot(model, type = 2)
+# Run this chunk multiple times to see how the variable importance changes
+```
+
+### Question: How can we tell which variables are really important?
+
+### A common technique with random forests and other models that rely on randomness is to simply do the training process a number of times and average the results. Here, we'll do it 50 times
+```{r, fig.height = 6}
+imp_list <- list()
+for(i in 1:50){
+  model = randomForest(ps@otu_table, y = as.factor(ps@sam_data$Class), mtry = mtry_best)
+  imp_list[i] <- varImp(model)
+}
+
+imp_df <- do.call(rbind.data.frame, imp_list)
+colnames(imp_df) <- colnames(x_train)
+colMeans(imp_df)
+barplot(sort(colMeans(imp_df)), horiz = T, las = 1, xlab = "Mean variable importance")
+#These importance scores should not change much, because they are averages.
+
+#one weakness of random forests is that while they return variable importance, it is difficult (but still possible) to get the directionality of each variable (positively or negatively associated with output variable). This is because random forests allow for large amounts of dependence. A low value for a taxa2 might mean forager when paired with a high value for taxa 18, but worker when paired with a high value for taxa 21. It's difficult to pull apart those inconsistencies in the model. 
+```
+
+
+
+
+
+
+# Mona-RF
+# Mona-RF
